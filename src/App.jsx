@@ -165,34 +165,152 @@ function todayStr() { return new Date().toISOString().slice(0, 10); }
 function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
 
 // ═══════════════════════════════════════════════════════════════
-// PROBLEM GENERATOR
+// ADAPTIVE ENGINE — spaced repetition + weak spot targeting
 // ═══════════════════════════════════════════════════════════════
-function genProblem(lvl, prevAnswer = null) {
-  const op = lvl.ops[Math.floor(Math.random() * lvl.ops.length)];
-  let a, b, answer, display;
-  if (op === "×") {
+
+// Generate all possible fact pairs for a level
+function getAllFacts(lvl) {
+  const facts = [];
+  if (lvl.ops.includes("+")) {
+    for (let a=1; a<=lvl.maxNum; a++)
+      for (let b=1; b<=lvl.maxNum; b++)
+        if (!lvl.maxResult || a+b<=lvl.maxResult)
+          facts.push({ a, b, op:"+" });
+  }
+  if (lvl.ops.includes("-")) {
+    for (let a=2; a<=lvl.maxNum; a++)
+      for (let b=1; b<a; b++)
+        facts.push({ a, b, op:"-" });
+  }
+  if (lvl.ops.includes("×")) {
     const pool = lvl.multOf || Array.from({length:(lvl.maxFactor||10)-1},(_,i)=>i+2);
-    b = pool[Math.floor(Math.random()*pool.length)];
-    a = Math.floor(Math.random()*(lvl.maxFactor||10))+1;
-    answer = a*b; display = `${a} × ${b}`;
-  } else if (op === "+") {
-    a = prevAnswer ?? (Math.floor(Math.random()*(lvl.maxNum-1))+1);
-    const maxB = lvl.maxResult ? Math.max(1, Math.min(lvl.maxNum, lvl.maxResult-a)) : lvl.maxNum;
-    b = Math.floor(Math.random()*maxB)+1;
-    answer = a+b; display = `${a} + ${b}`;
-  } else {
-    a = prevAnswer ?? (Math.floor(Math.random()*lvl.maxNum)+2);
-    b = Math.floor(Math.random()*(a-1))+1;
-    answer = a-b; display = `${a} − ${b}`;
+    for (let a=1; a<=(lvl.maxFactor||10); a++)
+      for (const b of pool)
+        facts.push({ a, b, op:"×" });
   }
+  return facts;
+}
+
+// factKey: unique string per fact
+function factKey(f) { return `${f.op}${f.a}_${f.b}`; }
+
+// Score a fact: lower = needs more practice
+// Based on: error rate, average response time vs target, recency
+function scoreFact(key, stats, targetTime) {
+  const s = stats?.[key];
+  if (!s) return 1000; // never seen → highest priority
+  const errorRate = s.attempts > 0 ? s.errors / s.attempts : 0;
+  const avgT = s.times?.length > 0 ? s.times.reduce((a,b)=>a+b,0)/s.times.length : 999;
+  const speedScore = avgT / (targetTime || 4);
+  const recency = s.lastSeen ? (Date.now() - s.lastSeen) / 60000 : 999; // minutes ago
+  // weighted score: errors matter most, then speed, then recency
+  return errorRate * 100 + speedScore * 30 + Math.min(recency * 0.1, 20);
+}
+
+// Pick next problem using weighted random selection (higher score = more likely)
+function pickFact(lvl, factStats, targetTime, lastFact) {
+  const facts = getAllFacts(lvl);
+  if (facts.length === 0) return null;
+
+  // Score all facts
+  const scored = facts.map(f => ({
+    fact: f,
+    score: scoreFact(factKey(f), factStats, targetTime),
+  }));
+
+  // Exclude last fact to avoid immediate repeat
+  const lastKey = lastFact ? factKey(lastFact) : null;
+  const eligible = scored.filter(s => factKey(s.fact) !== lastKey);
+  const pool = eligible.length > 0 ? eligible : scored;
+
+  // Weighted random: probability proportional to score
+  const total = pool.reduce((sum, s) => sum + s.score, 0);
+  let rand = Math.random() * total;
+  for (const s of pool) {
+    rand -= s.score;
+    if (rand <= 0) return s.fact;
+  }
+  return pool[pool.length-1].fact;
+}
+
+function buildProblem(fact) {
+  const { a, b, op } = fact;
+  let answer, display;
+  if (op === "+")  { answer = a+b; display = `${a} + ${b}`; }
+  else if (op==="-") { answer = a-b; display = `${a} − ${b}`; }
+  else               { answer = a*b; display = `${a} × ${b}`; }
+
+  // Smart wrong choices: nearby numbers + common mistake patterns
   const wrong = new Set();
-  let tries=0;
-  while(wrong.size<3 && tries++<40){
-    const d=Math.floor(Math.random()*4)+1;
-    const w=Math.random()<0.5?answer+d:answer-d;
-    if(w!==answer&&w>=0) wrong.add(w);
+  let tries = 0;
+  while (wrong.size < 3 && tries++ < 50) {
+    let w;
+    const r = Math.random();
+    if (r < 0.4) {
+      // off-by-one or off-by-two
+      const d = Math.floor(Math.random()*3)+1;
+      w = Math.random()<0.5 ? answer+d : answer-d;
+    } else if (r < 0.7 && op==="+") {
+      // common mistake: add wrong operand
+      w = a + b + (Math.random()<0.5 ? a : b) - (Math.random()<0.5 ? 1 : 2);
+    } else {
+      w = answer + (Math.floor(Math.random()*8)-4);
+    }
+    if (w !== answer && w >= 0 && Number.isInteger(w)) wrong.add(w);
   }
-  return { a,b,op,display,answer, choices:[...wrong,answer].sort(()=>Math.random()-0.5) };
+  return { a, b, op, display, answer, choices:[...wrong,answer].sort(()=>Math.random()-0.5) };
+}
+
+// Main entry — picks adaptive problem
+function genProblem(lvl, factStats, targetTime, lastFact) {
+  const fact = pickFact(lvl, factStats, targetTime, lastFact);
+  if (!fact) {
+    // fallback: random
+    const ops = lvl.ops;
+    const op = ops[Math.floor(Math.random()*ops.length)];
+    const a = Math.floor(Math.random()*(lvl.maxNum||10))+1;
+    const b = Math.floor(Math.random()*(lvl.maxNum||10))+1;
+    return buildProblem({ a, b, op });
+  }
+  return buildProblem(fact);
+}
+
+// Update fact stats after answer
+function updateFactStats(factStats, fact, isCorrect, rt) {
+  const key = factKey(fact);
+  const prev = factStats?.[key] || { attempts:0, errors:0, times:[], lastSeen:null };
+  return {
+    ...factStats,
+    [key]: {
+      attempts: prev.attempts + 1,
+      errors:   prev.errors + (isCorrect ? 0 : 1),
+      times:    [...(prev.times||[]).slice(-9), rt],
+      lastSeen: Date.now(),
+    },
+  };
+}
+
+// Compute adaptive target time from recent performance
+function computeTarget(factStats, baseMasteryTime) {
+  const allTimes = Object.values(factStats||{}).flatMap(s=>s.times||[]);
+  if (allTimes.length < 5) return baseMasteryTime * 2.5;
+  const recent = allTimes.slice(-20);
+  const avg = recent.reduce((a,b)=>a+b,0)/recent.length;
+  // Target = 80% of current average, but never below mastery time
+  return Math.max(baseMasteryTime, Math.min(avg * 0.8, baseMasteryTime * 2.5));
+}
+
+// Get top N weakest facts for parent report
+function getWeakFacts(factStats, n=5) {
+  return Object.entries(factStats||{})
+    .filter(([,s])=>s.attempts>=3)
+    .map(([key,s])=>({
+      key,
+      errorRate: s.errors/s.attempts,
+      avgTime: s.times?.length>0?s.times.reduce((a,b)=>a+b,0)/s.times.length:0,
+    }))
+    .sort((a,b)=>b.errorRate-a.errorRate)
+    .slice(0,n);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -246,6 +364,7 @@ const DEFAULT_GS = {
   masteryProgress: {},
   unlockedLevels: [1],
   parentPin: DEFAULT_PIN,
+  factStats: {}, // { levelId: { factKey: { attempts, errors, times[], lastSeen } } }
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -346,12 +465,12 @@ export default function MathQuest() {
 
   const timerRef = useRef(null);
   const startRef = useRef(null);
+  const lastFactRef = useRef(null);
   const isSk     = lang === "sk";
 
   const currentLvl = CURRICULUM.find(l=>l.id===gs.currentLevelId)||CURRICULUM[0];
-  const mp = gs.masteryProgress?.[gs.currentLevelId]||{correct:0,times:[],daysPlayed:[]};
-  const avgTime = mp.times?.length>4 ? mp.times.slice(-10).reduce((a,b)=>a+b,0)/Math.min(10,mp.times.length) : currentLvl.mastery.avgTime*2.5;
-  const dynamicTarget = Math.max(currentLvl.mastery.avgTime*0.8, Math.min(avgTime*0.95, currentLvl.mastery.avgTime*2.5));
+  const currentFactStats = gs.factStats?.[gs.currentLevelId] || {};
+  const dynamicTarget = computeTarget(currentFactStats, currentLvl.mastery.avgTime);
 
   // ── init Firebase auth listener ──
   useEffect(()=>{
@@ -424,7 +543,10 @@ export default function MathQuest() {
   }
 
   function startGame(){
-    setProblem(genProblem(currentLvl));
+    lastFactRef.current = null;
+    const p = genProblem(currentLvl, currentFactStats, dynamicTarget, null);
+    lastFactRef.current = { a:p.a, b:p.b, op:p.op };
+    setProblem(p);
     setSelected(null); setAiMsg(""); setCelebrate(false); setShake(false);
     setSessionCorrect(0); setSessionTotal(0); setSessionTimes([]);
     setElapsed(0); startRef.current=Date.now();
@@ -443,9 +565,12 @@ export default function MathQuest() {
     if(isCorrect) setCelebrate(true);
     else { setShake(true); setTimeout(()=>setShake(false),600); }
 
+    const currentFact = { a:problem.a, b:problem.b, op:problem.op };
     updateGs(prev=>{
       const mp=prev.masteryProgress?.[prev.currentLevelId]||{correct:0,times:[],daysPlayed:[]};
       const days=new Set(mp.daysPlayed||[]); days.add(todayStr());
+      const levelFactStats = prev.factStats?.[prev.currentLevelId] || {};
+      const newFactStats = updateFactStats(levelFactStats, currentFact, isCorrect, rt);
       return {
         ...prev,
         masteryProgress:{
@@ -455,6 +580,10 @@ export default function MathQuest() {
             times:[...(mp.times||[]).slice(-49),rt],
             daysPlayed:[...days],
           },
+        },
+        factStats:{
+          ...prev.factStats,
+          [prev.currentLevelId]: newFactStats,
         },
       };
     });
@@ -466,7 +595,11 @@ export default function MathQuest() {
 
   function nextProblem(){
     if(sessionCorrect>=DAILY_GOAL){ finishSession(); return; }
-    setProblem(genProblem(currentLvl,problem?.answer));
+    const updatedStats = gs.factStats?.[gs.currentLevelId] || {};
+    const updatedTarget = computeTarget(updatedStats, currentLvl.mastery.avgTime);
+    const p = genProblem(currentLvl, updatedStats, updatedTarget, lastFactRef.current);
+    lastFactRef.current = { a:p.a, b:p.b, op:p.op };
+    setProblem(p);
     setSelected(null); setAiMsg(""); setCelebrate(false);
     setElapsed(0); startRef.current=Date.now();
   }
@@ -927,6 +1060,36 @@ export default function MathQuest() {
               </div>
             ))}
         </div>
+
+        {/* Weak spots */}
+        {(()=>{
+          const weak = getWeakFacts(gs.factStats?.[gs.currentLevelId], 5);
+          if(weak.length===0) return null;
+          return (
+            <div style={{...card,padding:"18px 20px"}}>
+              <div style={{fontWeight:900,fontSize:14,marginBottom:10}}>
+                🎯 {isSk?"Slabé miesta — treba precvičiť":"Weak spots — needs practice"}
+              </div>
+              {weak.map((w,i)=>{
+                const [,ab] = w.key.match(/^([\+\-×÷])(.+)$/) || [,"?"];
+                const pct = Math.round(w.errorRate*100);
+                return (
+                  <div key={i} style={{display:"flex",justifyContent:"space-between",
+                    alignItems:"center",padding:"7px 0",borderBottom:`1px solid ${C.border}`,fontSize:14}}>
+                    <span style={{fontWeight:900,color:C.text,fontSize:16}}>
+                      {w.key.replace(/_/," ").replace(/\+/,"+ ").replace(/-/,"− ").replace(/×/,"× ")}
+                    </span>
+                    <span style={{color:pct>50?C.wrong:C.a1}}>{pct}% {isSk?"chýb":"errors"}</span>
+                    <span style={{color:C.sub}}>⏱ {w.avgTime.toFixed(1)}s</span>
+                  </div>
+                );
+              })}
+              <div style={{fontSize:12,color:C.sub,marginTop:8,textAlign:"center"}}>
+                {isSk?"Algoritmus ich bude opakovať častejšie automaticky.":"The algorithm will repeat these more often automatically."}
+              </div>
+            </div>
+          );
+        })()}
 
         {/* Settings */}
         <div style={{...card,padding:"16px 20px"}}>
